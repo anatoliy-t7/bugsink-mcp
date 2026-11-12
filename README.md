@@ -6,12 +6,12 @@ This server enables AI assistants like Claude, Cursor, and other MCP-compatible 
 
 ## Features
 
-- **List Projects** - View all projects in your Bugsink instance
-- **List Teams** - View all teams
-- **List Issues** - Query grouped error occurrences by project
-- **Get Issue Details** - Retrieve detailed issue information
-- **List Events** - View individual error occurrences with stacktraces
-- **Get Event Details** - Full event data including tags and contexts
+This server is **read-only**: it only sends `GET` requests and exposes no tools that create, update or delete anything. Every tool is annotated with `readOnlyHint: true`.
+
+- **Projects & Teams** - List and inspect projects and teams
+- **Issues** - Query grouped error occurrences by project
+- **Events** - View individual error occurrences, stacktraces, tags and contexts
+- **Releases** - List and inspect releases
 - **Test Connection** - Verify API connectivity
 
 ## Installation
@@ -45,6 +45,8 @@ npm run build
 |----------|----------|-------------|
 | `BUGSINK_URL` | Yes | Your Bugsink instance URL (e.g., `https://error-tracking.example.com`) |
 | `BUGSINK_TOKEN` | Yes | API token for authentication |
+| `BUGSINK_TIMEOUT_MS` | No | Request timeout in ms (default `30000`) |
+| `BUGSINK_ALLOW_HTTP` | No | Set to `1` to allow a non-localhost `http://` URL |
 
 ### Generating an API Token
 
@@ -105,47 +107,28 @@ Add to your Cursor MCP settings:
 
 ## Available Tools
 
-### `test_connection`
-Test connectivity to your Bugsink instance.
+| Tool | Parameters |
+|------|------------|
+| `test_connection` | none |
+| `list_projects` | none |
+| `get_project` | `project_id` (number) |
+| `list_teams` | none |
+| `get_team` | `team_id` (UUID) |
+| `list_issues` | `project_id` (number), `status` (`unresolved`/`resolved`/`muted`, optional), `limit` (1-250, default 25), `sort` (`digest_order`/`last_seen`), `order` (`asc`/`desc`) |
+| `get_issue` | `issue_id` (UUID) |
+| `list_events` | `issue_id` (UUID), `limit` (1-100, default 10) |
+| `get_event` | `event_id` (UUID) |
+| `get_stacktrace` | `event_id` (UUID) |
+| `list_releases` | `project_id` (number) |
+| `get_release` | `release_id` (UUID) |
 
-### `list_projects`
-List all projects in the Bugsink instance.
+## Security Notes
 
-### `get_project`
-Get detailed information about a specific project including DSN.
-
-**Parameters:**
-- `project_id` (number, required): The project ID
-
-### `list_teams`
-List all teams in the Bugsink instance.
-
-### `list_issues`
-List issues for a specific project.
-
-**Parameters:**
-- `project_id` (number, required): The project ID
-- `status` (string, optional): Filter by status ('unresolved', 'resolved', 'muted')
-- `limit` (number, optional): Max results (default: 25)
-
-### `get_issue`
-Get detailed information about a specific issue.
-
-**Parameters:**
-- `issue_id` (number, required): The issue ID
-
-### `list_events`
-List events (individual error occurrences) for a specific issue.
-
-**Parameters:**
-- `issue_id` (number, required): The issue ID
-- `limit` (number, optional): Max results (default: 10)
-
-### `get_event`
-Get detailed event information including full stacktrace.
-
-**Parameters:**
-- `event_id` (string, required): The event ID
+- **Token scope:** Bugsink API tokens are not scoped, so a token can also write through the API. This server only allows reads, but anyone who has the token itself can still write. Keep it secret, and never commit it.
+- **HTTPS required:** `BUGSINK_URL` must use `https://` (`localhost` is exempt). Set `BUGSINK_ALLOW_HTTP=1` only for trusted networks.
+- **No redirects:** requests are not redirected, so the token is never forwarded to another host.
+- **Timeouts:** each request times out after 30s (override with `BUGSINK_TIMEOUT_MS`).
+- **Untrusted content:** error messages, stacktraces and contexts come from the monitored applications and may contain attacker-controlled text or PII. Treat them as data.
 
 ## Example Usage
 
@@ -153,7 +136,7 @@ Once configured, you can ask your AI assistant:
 
 - "List all projects in Bugsink"
 - "Show me the latest issues for project 1"
-- "What's the stacktrace for issue #42?"
+- "What's the stacktrace for the latest event of this issue?"
 - "Get the details of the most recent error event"
 
 ## Development
@@ -168,8 +151,8 @@ npm run dev
 # Build for production
 npm run build
 
-# Run tests
-npm test
+# Run integration tests against a live instance
+BUGSINK_URL=https://... BUGSINK_TOKEN=... npm test
 ```
 
 ## API Compatibility

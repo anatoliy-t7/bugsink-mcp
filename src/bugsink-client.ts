@@ -1,13 +1,18 @@
 /**
- * Bugsink API Client
+ * Bugsink API Client (read-only)
  *
  * Client for interacting with Bugsink's REST API.
  * API docs: https://www.bugsink.com/blog/bugsink-2.0-api/
+ *
+ * This client intentionally only issues GET requests. Bugsink API tokens are
+ * not scoped, so this code is the only thing preventing writes.
  */
 
 export interface BugsinkConfig {
   baseUrl: string;
   apiToken: string;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeoutMs?: number;
 }
 
 export interface PaginatedResponse<T> {
@@ -120,152 +125,159 @@ export interface Release {
   sort_epoch?: number;
 }
 
-export interface CreateProjectInput {
-  team: string;
-  name: string;
-  visibility?: 'joinable' | 'discoverable' | 'team_members';
-  alert_on_new_issue?: boolean;
-  alert_on_regression?: boolean;
-  alert_on_unmute?: boolean;
-  retention_max_event_count?: number;
+const MAX_ERROR_BODY = 500;
+
+/**
+ * Validate and normalize the Bugsink base URL. Requires https unless the host
+ * is local, so the API token is never sent in cleartext over the network.
+ */
+export function normalizeBaseUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`BUGSINK_URL is not a valid URL: ${raw}`);
+  }
+  const localHosts = ['localhost', '127.0.0.1', '[::1]'];
+  if (url.protocol === 'http:' && !localHosts.includes(url.hostname)) {
+    if (process.env.BUGSINK_ALLOW_HTTP !== '1') {
+      throw new Error(
+        'BUGSINK_URL must use https (set BUGSINK_ALLOW_HTTP=1 to override for trusted networks)'
+      );
+    }
+  } else if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error(`BUGSINK_URL must be an http(s) URL, got ${url.protocol}`);
+  }
+  if (url.username || url.password) {
+    throw new Error('BUGSINK_URL must not contain credentials');
+  }
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/+$/, '');
 }
 
-export interface UpdateProjectInput {
-  name?: string;
-  visibility?: 'joinable' | 'discoverable' | 'team_members';
-  alert_on_new_issue?: boolean;
-  alert_on_regression?: boolean;
-  alert_on_unmute?: boolean;
-  retention_max_event_count?: number;
-}
-
-export interface CreateTeamInput {
-  name: string;
-  visibility?: 'joinable' | 'discoverable' | 'hidden';
-}
-
-export interface UpdateTeamInput {
-  name?: string;
-  visibility?: 'joinable' | 'discoverable' | 'hidden';
-}
-
-export interface CreateReleaseInput {
-  project: number;
-  version: string;
-  timestamp?: string;
+/** Encode a single path segment so user input can't alter the request path. */
+function seg(value: string | number): string {
+  return encodeURIComponent(String(value));
 }
 
 export class BugsinkClient {
   private baseUrl: string;
   private apiToken: string;
+  private timeoutMs: number;
 
   constructor(config: BugsinkConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/$/, '');
+    this.baseUrl = normalizeBaseUrl(config.baseUrl);
     this.apiToken = config.apiToken;
+    this.timeoutMs = config.timeoutMs ?? 30_000;
   }
 
-  private async fetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  get origin(): string {
+    return this.baseUrl;
+  }
+
+  private async get(endpoint: string, accept: string): Promise<Response> {
     const url = `${this.baseUrl}/api/canonical/0${endpoint}`;
 
     const response = await fetch(url, {
-      ...options,
+      method: 'GET',
+      // Never follow redirects: avoids leaking the token or hitting unexpected endpoints.
+      redirect: 'error',
+      signal: AbortSignal.timeout(this.timeoutMs),
       headers: {
-        'Authorization': `Bearer ${this.apiToken}`,
-        'Content-Type': 'application/json',
-        ...options.headers,
+        Authorization: `Bearer ${this.apiToken}`,
+        Accept: accept,
       },
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Bugsink API error (${response.status}): ${errorText}`);
+      let body = '';
+      try {
+        body = (await response.text()).slice(0, MAX_ERROR_BODY);
+      } catch {
+        // ignore
+      }
+      throw new Error(`Bugsink API error (${response.status} ${response.statusText})${body ? `: ${body}` : ''}`);
     }
 
-    return response.json() as Promise<T>;
+    return response;
   }
 
-  /**
-   * List all projects
-   */
+  private async getJson<T>(endpoint: string): Promise<T> {
+    const response = await this.get(endpoint, 'application/json');
+    return (await response.json()) as T;
+  }
+
   async listProjects(): Promise<PaginatedResponse<Project>> {
-    return this.fetch<PaginatedResponse<Project>>('/projects/');
+    return this.getJson('/projects/');
   }
 
-  /**
-   * Get a specific project by ID
-   */
   async getProject(projectId: number): Promise<Project> {
-    return this.fetch<Project>(`/projects/${projectId}/`);
+    return this.getJson(`/projects/${seg(projectId)}/`);
   }
 
-  /**
-   * List all teams
-   */
   async listTeams(): Promise<PaginatedResponse<Team>> {
-    return this.fetch<PaginatedResponse<Team>>('/teams/');
+    return this.getJson('/teams/');
   }
 
-  /**
-   * List issues for a project
-   */
-  async listIssues(projectId: number, options?: {
-    status?: string;
-    limit?: number;
-    sort?: 'digest_order' | 'last_seen';
-    order?: 'asc' | 'desc';
-  }): Promise<PaginatedResponse<Issue>> {
+  async getTeam(teamId: string): Promise<Team> {
+    return this.getJson(`/teams/${seg(teamId)}/`);
+  }
+
+  async listIssues(
+    projectId: number,
+    options?: {
+      status?: string;
+      limit?: number;
+      sort?: 'digest_order' | 'last_seen';
+      order?: 'asc' | 'desc';
+    }
+  ): Promise<PaginatedResponse<Issue>> {
     const params = new URLSearchParams();
     params.set('project', projectId.toString());
+    if (options?.status) params.set('status', options.status);
+    if (options?.limit) params.set('limit', options.limit.toString());
+    if (options?.sort) params.set('sort', options.sort);
+    if (options?.order) params.set('order', options.order);
 
-    if (options?.status) {
-      params.set('status', options.status);
-    }
-    if (options?.limit) {
-      params.set('limit', options.limit.toString());
-    }
-    if (options?.sort) {
-      params.set('sort', options.sort);
-    }
-    if (options?.order) {
-      params.set('order', options.order);
-    }
-
-    return this.fetch<PaginatedResponse<Issue>>(`/issues/?${params.toString()}`);
+    const res = await this.getJson<PaginatedResponse<Issue>>(`/issues/?${params.toString()}`);
+    if (options?.limit) res.results = res.results.slice(0, options.limit);
+    return res;
   }
 
-  /**
-   * Get a specific issue by ID
-   */
   async getIssue(issueId: string): Promise<Issue> {
-    return this.fetch<Issue>(`/issues/${issueId}/`);
+    return this.getJson(`/issues/${seg(issueId)}/`);
   }
 
-  /**
-   * List events for an issue
-   */
-  async listEvents(issueId: string, options?: {
-    limit?: number;
-  }): Promise<PaginatedResponse<Event>> {
+  async listEvents(issueId: string, options?: { limit?: number }): Promise<PaginatedResponse<Event>> {
     const params = new URLSearchParams();
     params.set('issue', issueId);
+    if (options?.limit) params.set('limit', options.limit.toString());
 
-    if (options?.limit) {
-      params.set('limit', options.limit.toString());
-    }
-
-    return this.fetch<PaginatedResponse<Event>>(`/events/?${params.toString()}`);
+    const res = await this.getJson<PaginatedResponse<Event>>(`/events/?${params.toString()}`);
+    if (options?.limit) res.results = res.results.slice(0, options.limit);
+    return res;
   }
 
-  /**
-   * Get a specific event by ID
-   */
   async getEvent(eventId: string): Promise<Event> {
-    return this.fetch<Event>(`/events/${eventId}/`);
+    return this.getJson(`/events/${seg(eventId)}/`);
   }
 
-  /**
-   * Test connection to Bugsink instance
-   */
+  /** Get event stacktrace as pre-rendered Markdown */
+  async getEventStacktrace(eventId: string): Promise<string> {
+    const response = await this.get(`/events/${seg(eventId)}/stacktrace/`, 'text/markdown, text/plain, */*');
+    return response.text();
+  }
+
+  async listReleases(projectId: number): Promise<PaginatedResponse<Release>> {
+    const params = new URLSearchParams({ project: projectId.toString() });
+    return this.getJson(`/releases/?${params.toString()}`);
+  }
+
+  async getRelease(releaseId: string): Promise<Release> {
+    return this.getJson(`/releases/${seg(releaseId)}/`);
+  }
+
   async testConnection(): Promise<{ success: boolean; message: string }> {
     try {
       const projects = await this.listProjects();
@@ -279,108 +291,5 @@ export class BugsinkClient {
         message: error instanceof Error ? error.message : 'Unknown error',
       };
     }
-  }
-
-  // ============================================================================
-  // Mutation Methods
-  // ============================================================================
-
-  /**
-   * Create a new project
-   */
-  async createProject(input: CreateProjectInput): Promise<Project> {
-    return this.fetch<Project>('/projects/', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    });
-  }
-
-  /**
-   * Update an existing project
-   */
-  async updateProject(projectId: number, input: UpdateProjectInput): Promise<Project> {
-    return this.fetch<Project>(`/projects/${projectId}/`, {
-      method: 'PATCH',
-      body: JSON.stringify(input),
-    });
-  }
-
-  /**
-   * Get a specific team by ID
-   */
-  async getTeam(teamId: string): Promise<Team> {
-    return this.fetch<Team>(`/teams/${teamId}/`);
-  }
-
-  /**
-   * Create a new team
-   */
-  async createTeam(input: CreateTeamInput): Promise<Team> {
-    return this.fetch<Team>('/teams/', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    });
-  }
-
-  /**
-   * Update an existing team
-   */
-  async updateTeam(teamId: string, input: UpdateTeamInput): Promise<Team> {
-    return this.fetch<Team>(`/teams/${teamId}/`, {
-      method: 'PATCH',
-      body: JSON.stringify(input),
-    });
-  }
-
-  // ============================================================================
-  // Stacktrace Methods
-  // ============================================================================
-
-  /**
-   * Get event stacktrace as pre-rendered Markdown
-   */
-  async getEventStacktrace(eventId: string): Promise<string> {
-    const url = `${this.baseUrl}/api/canonical/0/events/${eventId}/stacktrace/`;
-
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${this.apiToken}`,
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Bugsink API error (${response.status}): ${errorText}`);
-    }
-
-    return response.text();
-  }
-
-  // ============================================================================
-  // Release Methods
-  // ============================================================================
-
-  /**
-   * List releases for a project
-   */
-  async listReleases(projectId: number): Promise<PaginatedResponse<Release>> {
-    return this.fetch<PaginatedResponse<Release>>(`/releases/?project=${projectId}`);
-  }
-
-  /**
-   * Get a specific release by ID
-   */
-  async getRelease(releaseId: string): Promise<Release> {
-    return this.fetch<Release>(`/releases/${releaseId}/`);
-  }
-
-  /**
-   * Create a new release
-   */
-  async createRelease(input: CreateReleaseInput): Promise<Release> {
-    return this.fetch<Release>('/releases/', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    });
   }
 }

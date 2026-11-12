@@ -7,9 +7,10 @@ set -e
 echo "=== Bugsink MCP Server Integration Test ==="
 echo ""
 
-# Configuration
-export BUGSINK_URL="https://error-tracking.bookingmanager.com"
-export BUGSINK_TOKEN="9eb79cc2ca05503cc75b30174b14c201fd3006dd"
+# Configuration: provide credentials via environment, never hardcode them.
+: "${BUGSINK_URL:?Set BUGSINK_URL (e.g. https://bugsink.example.com)}"
+: "${BUGSINK_TOKEN:?Set BUGSINK_TOKEN}"
+export BUGSINK_URL BUGSINK_TOKEN
 
 cd "$(dirname "$0")"
 
@@ -45,7 +46,7 @@ LIST_TOOLS='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVer
 TOOLS_RESPONSE=$(echo "$LIST_TOOLS" | timeout 5 node dist/index.js 2>/dev/null | tail -1)
 
 if echo "$TOOLS_RESPONSE" | grep -q "list_projects"; then
-  TOOL_COUNT=$(echo "$TOOLS_RESPONSE" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).result.tools.length" 2>/dev/null || echo "8")
+  TOOL_COUNT=$(echo "$TOOLS_RESPONSE" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).result.tools.length" 2>/dev/null || echo "?")
   echo "  ✓ Found $TOOL_COUNT tools"
 else
   echo "  ✓ Tools endpoint responds"
